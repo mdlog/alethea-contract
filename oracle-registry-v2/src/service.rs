@@ -30,6 +30,9 @@ pub struct Voter {
     /// Available stake (stake - locked_stake, in tokens)
     pub available_stake: String,
     
+    /// Pending rewards to claim (in tokens)
+    pub pending_rewards: String,
+    
     /// Reputation score (0-100)
     pub reputation: u32,
     
@@ -100,13 +103,19 @@ pub struct Query {
     /// Query status (Active, Resolved, Expired, Cancelled)
     pub status: String,
     
+    /// Current voting phase (Commit, Reveal, Completed)
+    pub phase: String,
+    
     /// Resolved result (if resolved)
     pub result: Option<String>,
     
     /// Resolution timestamp (ISO 8601 format, if resolved)
     pub resolved_at: Option<String>,
     
-    /// Number of votes submitted
+    /// Number of commits (phase 1)
+    pub commit_count: u32,
+    
+    /// Number of revealed votes (phase 2)
     pub vote_count: u32,
     
     /// Time remaining until deadline (in seconds, 0 if expired)
@@ -226,6 +235,7 @@ impl Voter {
     fn from_voter_info(
         info: state::VoterInfo,
         available_stake: linera_sdk::linera_base_types::Amount,
+        pending_rewards: linera_sdk::linera_base_types::Amount,
         state: &OracleRegistryV2,
     ) -> Self {
         let accuracy_percentage = if info.total_votes > 0 {
@@ -245,6 +255,7 @@ impl Voter {
             stake: info.stake.to_string(),
             locked_stake: info.locked_stake.to_string(),
             available_stake: available_stake.to_string(),
+            pending_rewards: pending_rewards.to_string(),
             reputation: info.reputation,
             reputation_tier,
             reputation_weight,
@@ -282,6 +293,13 @@ impl Query {
             state::QueryStatus::Cancelled => "Cancelled",
         }.to_string();
         
+        // Convert phase enum to string
+        let phase = match query.phase {
+            state::VotingPhase::Commit => "Commit",
+            state::VotingPhase::Reveal => "Reveal",
+            state::VotingPhase::Completed => "Completed",
+        }.to_string();
+        
         // Convert timestamps to microseconds strings (for JavaScript compatibility)
         let created_at = query.created_at.micros().to_string();
         let deadline = query.deadline.micros().to_string();
@@ -297,6 +315,9 @@ impl Query {
             0
         };
         
+        // Count commits (phase 1) and revealed votes (phase 2)
+        let commit_count = query.commits.len();
+        
         Self {
             id: query.id,
             description: query.description,
@@ -310,8 +331,10 @@ impl Query {
             commit_end,
             reveal_end,
             status,
+            phase,
             result: query.result,
             resolved_at,
+            commit_count: commit_count as u32,
             vote_count: vote_count as u32,
             time_remaining,
             votes: None, // Votes are populated separately when needed
@@ -482,8 +505,11 @@ impl QueryRoot {
         // Get available stake (total stake - locked stake)
         let available_stake = self.state.get_available_stake(&chain_id).await;
         
+        // Get pending rewards
+        let pending_rewards = self.state.get_pending_rewards(&chain_id).await;
+        
         // Convert to GraphQL Voter type
-        let voter = Voter::from_voter_info(voter_info, available_stake, &self.state);
+        let voter = Voter::from_voter_info(voter_info, available_stake, pending_rewards, &self.state);
         
         Ok(Some(voter))
     }
@@ -585,8 +611,11 @@ impl QueryRoot {
             // Get available stake
             let available_stake = self.state.get_available_stake(&address).await;
             
+            // Get pending rewards
+            let pending_rewards = self.state.get_pending_rewards(&address).await;
+            
             // Convert to GraphQL Voter type
-            let voter = Voter::from_voter_info(voter_info, available_stake, &self.state);
+            let voter = Voter::from_voter_info(voter_info, available_stake, pending_rewards, &self.state);
             voters.push(voter);
             count += 1;
         }
@@ -647,7 +676,8 @@ impl QueryRoot {
         };
         
         let available_stake = self.state.get_available_stake(&chain_id).await;
-        let voter = Voter::from_voter_info(voter_info, available_stake, &self.state);
+        let pending_rewards = self.state.get_pending_rewards(&chain_id).await;
+        let voter = Voter::from_voter_info(voter_info, available_stake, pending_rewards, &self.state);
         
         Ok(Some(voter))
     }
@@ -776,13 +806,12 @@ impl MutationRoot {
     ) -> String {
         use oracle_registry_v2::Operation;
         
-        // Validate and parse stake
-        let stake_value = match stake.parse::<u128>() {
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        // This is consistent with how alethea-token handles amounts
+        let stake_amount: Amount = match stake.parse() {
             Ok(v) => v,
-            Err(_) => return "Error: Invalid stake format".to_string(),
+            Err(_) => return "Error: Invalid stake format. Use format like '100.' with trailing dot".to_string(),
         };
-        
-        let stake_amount = Amount::from_tokens(stake_value);
         
         // Create RegisterVoter operation
         let operation = Operation::RegisterVoter {
@@ -1388,15 +1417,9 @@ impl MutationRoot {
             return Err("Voter address is required".to_string());
         }
         
-        // Validate stake
-        let stake_value = stake.parse::<u128>()
-            .map_err(|_| "Invalid stake format: must be a valid number".to_string())?;
-        
-        if stake_value < 100 {
-            return Err("Minimum stake is 100 tokens".to_string());
-        }
-        
-        let stake_amount = Amount::from_tokens(stake_value);
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        let stake_amount: Amount = stake.parse()
+            .map_err(|_| "Invalid stake format. Use format like '100.' with trailing dot".to_string())?;
         
         // Create operation (chain_id is automatically detected by contract)
         let operation = Operation::RegisterVoter {
@@ -1466,14 +1489,13 @@ impl MutationRoot {
     ) -> Result<bool, String> {
         use oracle_registry_v2::Operation;
         
-        let stake_value = additional_stake.parse::<u128>()
-            .map_err(|_| "Invalid stake format".to_string())?;
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        let stake_amount: Amount = additional_stake.parse()
+            .map_err(|_| "Invalid stake format. Use format like '100.' with trailing dot".to_string())?;
         
-        if stake_value == 0 {
+        if stake_amount == Amount::ZERO {
             return Err("Additional stake must be greater than 0".to_string());
         }
-        
-        let stake_amount = Amount::from_tokens(stake_value);
         
         let operation = Operation::UpdateStake {
             additional_stake: stake_amount,
@@ -1532,15 +1554,9 @@ impl MutationRoot {
             return Err("Voter address cannot be empty".to_string());
         }
         
-        // Validate stake
-        let stake_value = stake.parse::<u128>()
-            .map_err(|_| "Invalid stake format: must be a valid number".to_string())?;
-        
-        if stake_value < 100 {
-            return Err("Minimum stake is 100 tokens".to_string());
-        }
-        
-        let stake_amount = Amount::from_tokens(stake_value);
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        let stake_amount: Amount = stake.parse()
+            .map_err(|_| "Invalid stake format. Use format like '100.' with trailing dot".to_string())?;
         
         // Create operation
         let operation = Operation::RegisterVoterFor {
@@ -1729,6 +1745,295 @@ impl MutationRoot {
         use oracle_registry_v2::Operation;
         
         let operation = Operation::ResolveQuery { query_id };
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send RegisterVoter message to target chain (cross-chain registration)
+    /// 
+    /// This mutation sends a cross-chain message to register as a voter on the target chain.
+    /// The voter's chain ID will be the sender's chain ID (automatically detected).
+    /// 
+    /// # Arguments
+    /// * `target_chain` - The chain ID where the registry is deployed (app chain)
+    /// * `stake` - Initial stake amount (in tokens as string)
+    /// * `name` - Optional voter name
+    /// * `metadata_url` - Optional URL to voter metadata
+    /// 
+    /// # Returns
+    /// `true` if message was scheduled successfully
+    /// 
+    /// # Example
+    /// ```graphql
+    /// mutation {
+    ///   sendRegisterVoterMessage(
+    ///     targetChain: "208873b668818fc962d8470c68698dc5dff2321720a9bb0d74576d45f4f73c91",
+    ///     stake: "100",
+    ///     name: "Alice"
+    ///   )
+    /// }
+    /// ```
+    async fn send_register_voter_message(
+        &self,
+        target_chain: String,
+        stake: String,
+        name: Option<String>,
+        metadata_url: Option<String>,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        let stake_amount: Amount = stake.parse()
+            .map_err(|_| "Invalid stake format. Use format like '100.' with trailing dot".to_string())?;
+        
+        if stake_amount == Amount::ZERO {
+            return Err("Stake must be greater than zero".to_string());
+        }
+        
+        // Create SendRegisterVoterMessage operation
+        let operation = Operation::SendRegisterVoterMessage {
+            target_chain: target_chain_id,
+            stake: stake_amount,
+            name,
+            metadata_url,
+        };
+        
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send UpdateStake message to target chain (cross-chain stake update)
+    /// 
+    /// This mutation sends a cross-chain message to update stake on the target chain.
+    /// The voter's chain ID will be the sender's chain ID (automatically detected).
+    /// 
+    /// # Arguments
+    /// * `target_chain` - The chain ID where the registry is deployed (app chain)
+    /// * `additional_stake` - Amount of additional stake to add
+    /// 
+    /// # Returns
+    /// `true` if message was scheduled successfully
+    /// 
+    /// # Example
+    /// ```graphql
+    /// mutation {
+    ///   sendUpdateStakeMessage(
+    ///     targetChain: "208873b668818fc962d8470c68698dc5dff2321720a9bb0d74576d45f4f73c91",
+    ///     additionalStake: "100"
+    ///   )
+    /// }
+    /// ```
+    async fn send_update_stake_message(
+        &self,
+        target_chain: String,
+        additional_stake: String,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Parse stake as Amount directly (expects format like "100." with trailing dot)
+        let stake_amount: Amount = additional_stake.parse()
+            .map_err(|_| "Invalid stake format. Use format like '100.' with trailing dot".to_string())?;
+        
+        if stake_amount == Amount::ZERO {
+            return Err("Additional stake must be greater than zero".to_string());
+        }
+        
+        // Create SendUpdateStakeMessage operation
+        let operation = Operation::SendUpdateStakeMessage {
+            target_chain: target_chain_id,
+            additional_stake: stake_amount,
+        };
+        
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send SubmitVote message to target chain (cross-chain voting)
+    /// 
+    /// This mutation sends a cross-chain message to submit a vote on the target chain.
+    /// The voter's chain ID will be the sender's chain ID (automatically detected).
+    /// 
+    /// # Arguments
+    /// * `target_chain` - The chain ID where the registry is deployed (app chain)
+    /// * `query_id` - ID of the query to vote on
+    /// * `value` - The vote value (must be one of the query's outcomes)
+    /// * `confidence` - Optional confidence score (0-100)
+    /// 
+    /// # Returns
+    /// `true` if message was scheduled successfully
+    /// 
+    /// # Example
+    /// ```graphql
+    /// mutation {
+    ///   sendSubmitVoteMessage(
+    ///     targetChain: "208873b668818fc962d8470c68698dc5dff2321720a9bb0d74576d45f4f73c91",
+    ///     queryId: 1,
+    ///     value: "Yes",
+    ///     confidence: 80
+    ///   )
+    /// }
+    /// ```
+    async fn send_submit_vote_message(
+        &self,
+        target_chain: String,
+        query_id: u64,
+        value: String,
+        confidence: Option<i32>,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Validate confidence if provided
+        let confidence_u8 = match confidence {
+            Some(c) => {
+                if c < 0 || c > 100 {
+                    return Err("Confidence must be between 0 and 100".to_string());
+                }
+                Some(c as u8)
+            }
+            None => None,
+        };
+        
+        // Create SendSubmitVoteMessage operation
+        let operation = Operation::SendSubmitVoteMessage {
+            target_chain: target_chain_id,
+            query_id,
+            value,
+            confidence: confidence_u8,
+        };
+        
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send a cross-chain message to create a query on the target chain
+    async fn send_create_query_message(
+        &self,
+        target_chain: String,
+        description: String,
+        outcomes: Vec<String>,
+        strategy: String,
+        reward_amount: String,
+        min_votes: Option<i32>,
+        duration_secs: Option<i32>,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        use oracle_registry_v2::state::DecisionStrategy;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Parse strategy
+        let strategy_enum = match strategy.as_str() {
+            "Majority" => DecisionStrategy::Majority,
+            "Median" => DecisionStrategy::Median,
+            "WeightedByStake" => DecisionStrategy::WeightedByStake,
+            "WeightedByReputation" => DecisionStrategy::WeightedByReputation,
+            _ => return Err(format!("Invalid strategy: {}", strategy)),
+        };
+        
+        // Parse reward amount
+        let reward_value = reward_amount.trim_end_matches('.').parse::<u128>()
+            .map_err(|_| "Invalid reward amount format".to_string())?;
+        let reward = Amount::from_tokens(reward_value);
+        
+        // Create SendCreateQueryMessage operation
+        let operation = Operation::SendCreateQueryMessage {
+            target_chain: target_chain_id,
+            description,
+            outcomes,
+            strategy: strategy_enum,
+            min_votes: min_votes.map(|v| v as usize),
+            reward_amount: reward,
+            duration_secs: duration_secs.map(|d| d as u64),
+        };
+        
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send a cross-chain message to commit a vote on the target chain
+    async fn send_commit_vote_message(
+        &self,
+        target_chain: String,
+        query_id: i32,
+        commit_hash: String,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Validate commit hash
+        if commit_hash.is_empty() || commit_hash.len() > 128 {
+            return Err("Invalid commit hash format".to_string());
+        }
+        
+        // Create SendCommitVoteMessage operation
+        let operation = Operation::SendCommitVoteMessage {
+            target_chain: target_chain_id,
+            query_id: query_id as u64,
+            commit_hash,
+        };
+        
+        self.runtime.schedule_operation(&operation);
+        Ok(true)
+    }
+    
+    /// Send a cross-chain message to reveal a vote on the target chain
+    async fn send_reveal_vote_message(
+        &self,
+        target_chain: String,
+        query_id: i32,
+        value: String,
+        salt: String,
+        confidence: Option<i32>,
+    ) -> Result<bool, String> {
+        use oracle_registry_v2::Operation;
+        
+        // Parse target chain ID
+        let target_chain_id = target_chain.parse::<linera_sdk::linera_base_types::ChainId>()
+            .map_err(|e| format!("Invalid target chain ID: {}", e))?;
+        
+        // Validate value
+        if value.is_empty() {
+            return Err("Vote value cannot be empty".to_string());
+        }
+        
+        // Validate salt
+        if salt.is_empty() {
+            return Err("Salt cannot be empty".to_string());
+        }
+        
+        // Validate confidence if provided
+        if let Some(c) = confidence {
+            if c < 0 || c > 100 {
+                return Err("Confidence must be between 0 and 100".to_string());
+            }
+        }
+        
+        // Create SendRevealVoteMessage operation
+        let operation = Operation::SendRevealVoteMessage {
+            target_chain: target_chain_id,
+            query_id: query_id as u64,
+            value,
+            salt,
+            confidence: confidence.map(|c| c as u8),
+        };
+        
         self.runtime.schedule_operation(&operation);
         Ok(true)
     }

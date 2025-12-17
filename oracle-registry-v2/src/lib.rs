@@ -5,9 +5,21 @@
 //! 
 //! Simplified oracle registry where voters register with their account address
 //! instead of deploying separate applications.
+//!
+//! ## Cross-Chain Messaging
+//! 
+//! This contract supports real-time cross-chain event streaming using Linera's
+//! event system. Subscribers can receive notifications for:
+//! - Query creation and resolution
+//! - Vote submissions
+//! - Voter registration/deregistration
+//! - Reward claims
 
 pub mod state;
 pub mod migration;
+
+/// Stream name for Oracle events - used for cross-chain event subscription
+pub const ORACLE_STREAM_NAME: &str = "oracle_events";
 
 // NOTE: Unit tests are temporarily disabled due to Linera SDK test infrastructure complexity.
 // The contract and service code compiles and works correctly in production.
@@ -80,9 +92,134 @@ pub mod migration;
 // mod migration_tests;
 
 use async_graphql::{Request, Response, SimpleObject};
-use linera_sdk::linera_base_types::{Amount, Timestamp, ContractAbi, ServiceAbi};
+use linera_sdk::linera_base_types::{Amount, Timestamp, ContractAbi, ServiceAbi, ChainId};
 use serde::{Deserialize, Serialize};
 use state::{DecisionStrategy, ProtocolParameters};
+
+// ==================== ORACLE EVENTS (Cross-Chain Streaming) ====================
+
+/// Oracle events for real-time cross-chain notifications
+/// 
+/// These events are emitted using `runtime.emit()` and can be received by
+/// other chains that subscribe using `runtime.subscribe_to_events()`.
+/// 
+/// ## Usage
+/// 
+/// To subscribe to oracle events from another contract:
+/// ```rust
+/// // In instantiate or any operation
+/// self.runtime.subscribe_to_events(
+///     oracle_chain_id,
+///     oracle_app_id,
+///     StreamName::from(ORACLE_STREAM_NAME),
+/// );
+/// ```
+/// 
+/// To process received events:
+/// ```rust
+/// async fn process_streams(&mut self, updates: Vec<StreamUpdate>) {
+///     for update in updates {
+///         for index in update.previous_index..update.next_index {
+///             let event: OracleEvent = self.runtime.read_event(
+///                 update.chain_id,
+///                 update.stream_id.stream_name.clone(),
+///                 index,
+///             );
+///             // Handle event...
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum OracleEvent {
+    /// Emitted when a new query is created
+    QueryCreated {
+        query_id: u64,
+        description: String,
+        outcomes: Vec<String>,
+        deadline: Timestamp,
+        creator: ChainId,
+        min_votes: usize,
+    },
+    
+    /// Emitted when a query is resolved
+    QueryResolved {
+        query_id: u64,
+        result: String,
+        resolved_at: Timestamp,
+        total_votes: usize,
+        correct_voters: usize,
+    },
+    
+    /// Emitted when a query expires without resolution
+    QueryExpired {
+        query_id: u64,
+        expired_at: Timestamp,
+        votes_received: usize,
+        min_votes_required: usize,
+    },
+    
+    /// Emitted when a voter registers
+    VoterRegistered {
+        voter_chain: ChainId,
+        stake: Amount,
+        name: Option<String>,
+    },
+    
+    /// Emitted when a voter deregisters
+    VoterDeregistered {
+        voter_chain: ChainId,
+        stake_returned: Amount,
+    },
+    
+    /// Emitted when a vote is committed (phase 1)
+    VoteCommitted {
+        query_id: u64,
+        voter_chain: ChainId,
+        commit_hash: String,
+    },
+    
+    /// Emitted when a vote is revealed (phase 2)
+    VoteRevealed {
+        query_id: u64,
+        voter_chain: ChainId,
+        value: String,
+    },
+    
+    /// Emitted when a direct vote is submitted (no commit/reveal)
+    VoteSubmitted {
+        query_id: u64,
+        voter_chain: ChainId,
+        value: String,
+    },
+    
+    /// Emitted when rewards are claimed
+    RewardsClaimed {
+        voter_chain: ChainId,
+        amount: Amount,
+    },
+    
+    /// Emitted when protocol parameters are updated
+    ParametersUpdated {
+        min_stake: Amount,
+        min_votes_default: usize,
+        updated_by: ChainId,
+    },
+    
+    /// Emitted when protocol is paused/unpaused
+    ProtocolStatusChanged {
+        is_paused: bool,
+        changed_by: ChainId,
+    },
+    
+    /// Emitted when stake is updated
+    StakeUpdated {
+        voter_chain: ChainId,
+        new_stake: Amount,
+        change: Amount,
+        is_increase: bool,
+    },
+}
 
 /// Application ABI
 pub struct OracleRegistryV2Abi;
@@ -205,6 +342,60 @@ pub enum Operation {
     /// Auto-resolve queries that have completed reveal phase (maintenance operation)
     AutoResolveQueries,
     
+    /// Send RegisterVoter message to another chain (cross-chain registration)
+    /// This allows a user to register as voter on the main registry chain
+    /// by sending a cross-chain message from their own chain.
+    SendRegisterVoterMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        stake: Amount,
+        name: Option<String>,
+        metadata_url: Option<String>,
+    },
+    
+    /// Send SubmitVote message to another chain (cross-chain voting)
+    SendSubmitVoteMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        query_id: u64,
+        value: String,
+        confidence: Option<u8>,
+    },
+    
+    /// Send CommitVote message to another chain (cross-chain commit phase)
+    SendCommitVoteMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        query_id: u64,
+        commit_hash: String,
+    },
+    
+    /// Send RevealVote message to another chain (cross-chain reveal phase)
+    SendRevealVoteMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        query_id: u64,
+        value: String,
+        salt: String,
+        confidence: Option<u8>,
+    },
+    
+    /// Send CreateQuery message to another chain (cross-chain query creation)
+    /// This allows a user to create a query on the main registry chain
+    /// by sending a cross-chain message from their own chain.
+    SendCreateQueryMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        description: String,
+        outcomes: Vec<String>,
+        strategy: DecisionStrategy,
+        min_votes: Option<usize>,
+        reward_amount: Amount,
+        duration_secs: Option<u64>,
+    },
+    
+    /// Send UpdateStake message to another chain (cross-chain stake update)
+    /// This allows a user to add more stake from their own chain.
+    SendUpdateStakeMessage {
+        target_chain: linera_sdk::linera_base_types::ChainId,
+        additional_stake: Amount,
+    },
+    
     /// Create a query with callback information (for cross-application calls)
     /// This allows other applications to create queries and receive callbacks when resolved
     CreateQueryWithCallback {
@@ -230,16 +421,19 @@ pub enum Operation {
 /// Authentication is automatic - Linera verifies the message sender.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
-    /// Register as a voter
-    /// Sender's AccountOwner is extracted from message authentication
+    /// Register as a voter via cross-chain message
+    /// sender_chain is the chain ID of the voter (set by the sending contract)
     RegisterVoter {
+        sender_chain: ChainId,
         stake: Amount,
         name: Option<String>,
         metadata_url: Option<String>,
     },
     
-    /// Update stake
+    /// Update stake via cross-chain message
+    /// sender_chain is the chain ID of the voter (set by the sending contract)
     UpdateStake {
+        sender_chain: ChainId,
         additional_stake: Amount,
     },
     
@@ -252,20 +446,26 @@ pub enum Message {
     DeregisterVoter,
     
     /// Submit vote for a query (direct voting)
+    /// sender_chain is the chain ID of the voter (set by the sending contract)
     SubmitVote {
+        sender_chain: ChainId,
         query_id: u64,
         value: String,
         confidence: Option<u8>,
     },
     
     /// Commit a vote (phase 1 of commit/reveal)
+    /// sender_chain is the chain ID of the voter (set by the sending contract)
     CommitVote {
+        sender_chain: ChainId,
         query_id: u64,
         commit_hash: String,
     },
     
     /// Reveal a vote (phase 2 of commit/reveal)
+    /// sender_chain is the chain ID of the voter (set by the sending contract)
     RevealVote {
+        sender_chain: ChainId,
         query_id: u64,
         value: String,
         salt: String,
@@ -274,6 +474,17 @@ pub enum Message {
     
     /// Claim pending rewards
     ClaimRewards,
+    
+    /// Create a query via cross-chain message
+    CreateQuery {
+        sender_chain: ChainId,
+        description: String,
+        outcomes: Vec<String>,
+        strategy: String,
+        min_votes: Option<usize>,
+        reward_amount: Amount,
+        duration_secs: Option<u64>,
+    },
     
     /// Market Chain -> Registry: Create query from expired market (AUTOMATIC)
     /// This is sent automatically when a market expires and needs resolution
@@ -293,6 +504,23 @@ pub enum Message {
         resolved_outcome: String,
         resolved_at: Timestamp,
         callback_data: Vec<u8>,
+    },
+    
+    // ==================== TOKEN INTEGRATION MESSAGES ====================
+    
+    /// Receive tokens from alethea-token contract (for staking)
+    /// This is sent by the token contract when user calls TransferToApplication
+    ReceiveTokensForStake {
+        sender_chain: ChainId,
+        sender: String, // AccountOwner as string
+        amount: Amount,
+    },
+    
+    /// Request to withdraw tokens back to user
+    /// Registry will send WithdrawToAccount to token contract
+    WithdrawTokens {
+        amount: Amount,
+        target_chain: ChainId,
     },
 }
 

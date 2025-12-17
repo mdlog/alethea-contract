@@ -7,7 +7,7 @@
 //! instead of deploying separate applications.
 
 use linera_sdk::{
-    linera_base_types::{Amount, ChainId, Timestamp},
+    linera_base_types::{Amount, ApplicationId, ChainId, Timestamp},
     views::{linera_views, MapView, RegisterView, RootView, ViewStorageContext},
 };
 use serde::{Deserialize, Serialize};
@@ -110,6 +110,19 @@ pub struct Query {
     pub callback_data: Option<Vec<u8>>,
 }
 
+/// Callback information for cross-chain query resolution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryCallback {
+    /// Chain to send callback to
+    pub callback_chain: ChainId,
+    
+    /// Application to send callback to (optional)
+    pub callback_app: Option<ApplicationId>,
+    
+    /// Custom data to include in callback
+    pub callback_data: Vec<u8>,
+}
+
 /// Vote commit information (for commit/reveal voting)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteCommit {
@@ -210,6 +223,9 @@ pub struct ProtocolParameters {
     
     /// Protocol fee percentage (basis points)
     pub protocol_fee: u32,
+    
+    /// ALTH Token application ID (for real token integration)
+    pub token_app_id: Option<linera_sdk::linera_base_types::ApplicationId>,
 }
 
 impl Default for ProtocolParameters {
@@ -221,6 +237,7 @@ impl Default for ProtocolParameters {
             reward_percentage: 1000,        // 10%
             slash_percentage: 500,          // 5%
             protocol_fee: 100,              // 1%
+            token_app_id: None,             // Set after token deployment
         }
     }
 }
@@ -234,10 +251,15 @@ pub struct OracleRegistryV2 {
     pub total_stake: RegisterView<Amount>,
     pub voter_count: RegisterView<u64>,
     
+    // Token holdings (actual ALETHEA tokens held by registry)
+    pub token_holdings: MapView<ChainId, Amount>,  // Voter -> Token balance held
+    pub total_tokens_held: RegisterView<Amount>,   // Total tokens in registry
+    
     // Query management
     pub next_query_id: RegisterView<u64>,
     pub queries: MapView<u64, Query>,
     pub active_queries: RegisterView<Vec<u64>>,
+    pub query_callbacks: MapView<u64, QueryCallback>,  // ← NEW: For cross-chain callbacks
     
     // Voting records (query_id -> voter_chain -> vote)
     pub votes: MapView<(u64, ChainId), Vote>,
@@ -448,10 +470,8 @@ impl OracleRegistryV2 {
         let mut voter_info = self.get_voter(voter_chain).await
             .ok_or_else(|| "Voter not found".to_string())?;
         
-        let stake_value: u128 = voter_info.stake.into();
-        let locked_value: u128 = voter_info.locked_stake.into();
-        let available_value = stake_value.saturating_sub(locked_value);
-        let available_stake = Amount::from_tokens(available_value);
+        // Calculate available stake using saturating_sub on Amount directly
+        let available_stake = voter_info.stake.saturating_sub(voter_info.locked_stake);
         
         if available_stake < amount {
             return Err(format!(
@@ -460,8 +480,8 @@ impl OracleRegistryV2 {
             ));
         }
         
-        let amount_value: u128 = amount.into();
-        voter_info.locked_stake = Amount::from_tokens(locked_value + amount_value);
+        // Add to locked stake using saturating_add on Amount directly
+        voter_info.locked_stake = voter_info.locked_stake.saturating_add(amount);
         self.voters.insert(voter_chain, voter_info)
             .map_err(|e| format!("Failed to update voter: {}", e))?;
         
@@ -480,9 +500,8 @@ impl OracleRegistryV2 {
             ));
         }
         
-        let locked_value: u128 = voter_info.locked_stake.into();
-        let amount_value: u128 = amount.into();
-        voter_info.locked_stake = Amount::from_tokens(locked_value.saturating_sub(amount_value));
+        // Subtract from locked stake using saturating_sub on Amount directly
+        voter_info.locked_stake = voter_info.locked_stake.saturating_sub(amount);
         self.voters.insert(voter_chain, voter_info)
             .map_err(|e| format!("Failed to update voter: {}", e))?;
         
@@ -493,9 +512,8 @@ impl OracleRegistryV2 {
     pub async fn get_available_stake(&self, voter_chain: &ChainId) -> Amount {
         match self.get_voter(voter_chain).await {
             Some(info) => {
-                let stake_value: u128 = info.stake.into();
-                let locked_value: u128 = info.locked_stake.into();
-                Amount::from_tokens(stake_value.saturating_sub(locked_value))
+                // Use Amount's saturating_sub directly to avoid double conversion
+                info.stake.saturating_sub(info.locked_stake)
             },
             None => Amount::ZERO,
         }
@@ -808,28 +826,26 @@ impl OracleRegistryV2 {
     }
     
     /// Select top N voters by power for a query
+    /// 
+    /// TEMPORARY: Returns ALL active voters instead of top N by power
+    /// This allows all registered voters to participate in voting
     pub async fn select_voters_for_query(
         &self,
-        min_voters: usize,
-        max_voters: usize,
+        _min_voters: usize,
+        _max_voters: usize,
     ) -> Result<Vec<ChainId>, String> {
-        // Get all voters sorted by power
+        // TEMPORARY: Return ALL active voters instead of selecting by power
+        // This allows all registered voters to vote on any query
         let voter_powers = self.get_voters_by_power().await?;
         
-        // Check if we have enough voters
-        if voter_powers.len() < min_voters {
-            return Err(format!(
-                "Not enough active voters: have {}, need at least {}",
-                voter_powers.len(),
-                min_voters
-            ));
+        // Check if we have at least one voter
+        if voter_powers.is_empty() {
+            return Err("No active voters available".to_string());
         }
         
-        // Select top N voters (up to max_voters)
-        let n = max_voters.min(voter_powers.len());
+        // Return ALL voters (not just top N)
         let selected: Vec<ChainId> = voter_powers
             .iter()
-            .take(n)
             .map(|(chain_id, _power)| *chain_id)
             .collect();
         
